@@ -60,6 +60,27 @@ app.use((req, res, next) => {
 });
 
 (async () => {
+  // Critical Security: Validate required environment variables
+  if (!process.env.SESSION_SECRET) {
+    console.error('❌ FATAL ERROR: SESSION_SECRET environment variable is required!');
+    console.error('Please set SESSION_SECRET in your .env file.');
+    console.error('Generate a secure secret with: openssl rand -base64 32');
+    process.exit(1);
+  }
+
+  if (process.env.SESSION_SECRET === "kaiser-service-secret-key-change-in-production") {
+    console.error('❌ FATAL ERROR: Default SESSION_SECRET detected!');
+    console.error('You must use a unique, secure SESSION_SECRET in production.');
+    console.error('Generate a secure secret with: openssl rand -base64 32');
+    process.exit(1);
+  }
+
+  if (!process.env.DATABASE_URL) {
+    console.error('❌ FATAL ERROR: DATABASE_URL environment variable is required!');
+    console.error('Please set DATABASE_URL in your .env file.');
+    process.exit(1);
+  }
+
   await registerRoutes(httpServer, app);
 
   app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {

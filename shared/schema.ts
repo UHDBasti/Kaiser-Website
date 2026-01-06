@@ -104,12 +104,29 @@ export const postsRelations = relations(posts, ({ one }) => ({
   }),
 }));
 
-// Insert schemas
-export const insertUserSchema = createInsertSchema(users).omit({
-  id: true,
-  createdAt: true,
-  emailVerified: true,
-});
+// Insert schemas with password strength validation
+export const insertUserSchema = createInsertSchema(users)
+  .omit({
+    id: true,
+    createdAt: true,
+    emailVerified: true,
+  })
+  .refine(
+    (data) => data.password.length >= 8,
+    { message: "Passwort muss mindestens 8 Zeichen lang sein", path: ["password"] }
+  )
+  .refine(
+    (data) => /[A-Z]/.test(data.password),
+    { message: "Passwort muss mindestens einen Großbuchstaben enthalten", path: ["password"] }
+  )
+  .refine(
+    (data) => /[a-z]/.test(data.password),
+    { message: "Passwort muss mindestens einen Kleinbuchstaben enthalten", path: ["password"] }
+  )
+  .refine(
+    (data) => /[0-9]/.test(data.password),
+    { message: "Passwort muss mindestens eine Ziffer enthalten", path: ["password"] }
+  );
 
 export const insertEmailVerificationTokenSchema = createInsertSchema(emailVerificationTokens).omit({
   id: true,
