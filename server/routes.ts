@@ -8,6 +8,58 @@ import crypto from "crypto";
 import { insertUserSchema, insertThreadSchema, insertPostSchema, insertConsentLogSchema, insertCategorySchema } from "@shared/schema";
 import { z } from "zod";
 import { fromZodError } from "zod-validation-error";
+import rateLimit from "express-rate-limit";
+import helmet from "helmet";
+import { JSDOM } from "jsdom";
+import DOMPurify from "dompurify";
+
+// Initialize DOMPurify with JSDOM for server-side sanitization
+const window = new JSDOM('').window;
+const purify = DOMPurify(window as unknown as Window);
+
+// IP Anonymization utility (DSGVO compliance)
+function anonymizeIP(ip: string | undefined): string {
+  if (!ip) return '0.0.0.0';
+
+  if (ip.includes(':')) {
+    // IPv6: Remove last 80 bits (keep first 48 bits)
+    return ip.split(':').slice(0, 3).join(':') + '::';
+  }
+
+  // IPv4: Remove last octet
+  return ip.split('.').slice(0, 3).join('.') + '.0';
+}
+
+// HTML Sanitization for user-generated content
+function sanitizeHTML(content: string): string {
+  return purify.sanitize(content, {
+    ALLOWED_TAGS: ['p', 'b', 'i', 'u', 'br', 'a', 'ul', 'ol', 'li', 'code', 'pre', 'strong', 'em', 'blockquote', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'],
+    ALLOWED_ATTR: ['href', 'title', 'target', 'rel'],
+    ALLOW_DATA_ATTR: false,
+  });
+}
+
+// Rate limiters
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Max 100 requests per IP per window
+  message: 'Zu viele Anfragen von dieser IP, bitte versuchen Sie es später erneut.',
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // Max 5 login/register attempts
+  message: 'Zu viele Anmeldeversuche, bitte versuchen Sie es später erneut.',
+  skipSuccessfulRequests: true, // Don't count successful logins
+});
+
+const contactLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 3, // Max 3 contact form submissions per hour
+  message: 'Zu viele Kontaktanfragen, bitte versuchen Sie es später erneut.',
+});
 
 // Middleware to check if user is authenticated
 function isAuthenticated(req: any, res: any, next: any) {
@@ -23,10 +75,23 @@ function isEmailVerified(req: any, res: any, next: any) {
     return res.status(401).json({ message: "Nicht angemeldet" });
   }
   if (!req.user.emailVerified) {
-    return res.status(403).json({ 
+    return res.status(403).json({
       message: "E-Mail-Verifizierung erforderlich. Bitte bestätige zuerst deine E-Mail-Adresse.",
       code: "EMAIL_NOT_VERIFIED"
     });
+  }
+  return next();
+}
+
+// Middleware to check if user is admin
+function isAdmin(req: any, res: any, next: any) {
+  if (!req.isAuthenticated()) {
+    return res.status(401).json({ message: "Nicht angemeldet" });
+  }
+  // Check if user is admin by username (can be extended with isAdmin flag in schema)
+  const adminUsernames = process.env.ADMIN_USERNAME?.split(',').map(u => u.trim()) || ['admin'];
+  if (!adminUsernames.includes(req.user.username)) {
+    return res.status(403).json({ message: "Admin-Rechte erforderlich" });
   }
   return next();
 }
@@ -40,16 +105,42 @@ export async function registerRoutes(
   httpServer: Server,
   app: Express
 ): Promise<Server> {
+  // Security: Helmet.js for security headers
+  app.use(helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'", "https://cdn.jsdelivr.net"],
+        styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+        fontSrc: ["'self'", "https://fonts.gstatic.com"],
+        imgSrc: ["'self'", "data:", "https:", "blob:"],
+        connectSrc: ["'self'", "wss:", "https://api.elevenlabs.io", "https:"],
+        frameSrc: ["'self'"],
+        objectSrc: ["'none'"],
+        upgradeInsecureRequests: process.env.NODE_ENV === "production" ? [] : null,
+      },
+    },
+    hsts: {
+      maxAge: 31536000,
+      includeSubDomains: true,
+      preload: true,
+    },
+  }));
+
+  // Security: Apply general rate limiter to all API routes
+  app.use('/api/', generalLimiter);
+
   // Session configuration
   app.use(
     session({
-      secret: process.env.SESSION_SECRET || "kaiser-service-secret-key-change-in-production",
+      secret: process.env.SESSION_SECRET!, // Validated in server/index.ts
       resave: false,
       saveUninitialized: false,
       cookie: {
         secure: process.env.NODE_ENV === "production",
         httpOnly: true,
         maxAge: 1000 * 60 * 60 * 24 * 7, // 1 week
+        sameSite: 'strict', // CSRF protection
       },
     })
   );
@@ -59,9 +150,9 @@ export async function registerRoutes(
   app.use(passport.session());
 
   // ===== AUTH ROUTES =====
-  
+
   // Register with email verification
-  app.post("/api/auth/register", async (req, res, next) => {
+  app.post("/api/auth/register", authLimiter, async (req, res, next) => {
     try {
       const validatedData = insertUserSchema.parse(req.body);
       
@@ -99,7 +190,9 @@ export async function registerRoutes(
       const webhookUrl = process.env.N8N_EMAIL_WEBHOOK_URL;
       if (webhookUrl) {
         try {
-          const verificationUrl = `${req.protocol}://${req.get("host")}/verify-email?token=${token}`;
+          // Security: Use SITE_URL to prevent Host Header Injection
+          const siteUrl = process.env.SITE_URL || `${req.protocol}://${req.get("host")}`;
+          const verificationUrl = `${siteUrl}/verify-email?token=${token}`;
           await fetch(webhookUrl, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -165,7 +258,7 @@ export async function registerRoutes(
   });
 
   // Resend verification email
-  app.post("/api/auth/resend-verification", isAuthenticated, async (req, res, next) => {
+  app.post("/api/auth/resend-verification", authLimiter, isAuthenticated, async (req, res, next) => {
     try {
       const user = req.user as any;
       
@@ -186,7 +279,9 @@ export async function registerRoutes(
       // Send verification email via N8N webhook
       const webhookUrl = process.env.N8N_EMAIL_WEBHOOK_URL;
       if (webhookUrl) {
-        const verificationUrl = `${req.protocol}://${req.get("host")}/verify-email?token=${token}`;
+        // Security: Use SITE_URL to prevent Host Header Injection
+        const siteUrl = process.env.SITE_URL || `${req.protocol}://${req.get("host")}`;
+        const verificationUrl = `${siteUrl}/verify-email?token=${token}`;
         await fetch(webhookUrl, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -208,7 +303,7 @@ export async function registerRoutes(
   });
 
   // Login
-  app.post("/api/auth/login", (req, res, next) => {
+  app.post("/api/auth/login", authLimiter, (req, res, next) => {
     passport.authenticate("local", (err: any, user: any, info: any) => {
       if (err) return next(err);
       if (!user) {
@@ -291,7 +386,7 @@ export async function registerRoutes(
   });
 
   // Initialize default categories (admin endpoint)
-  app.post("/api/forum/categories/init", async (req, res, next) => {
+  app.post("/api/forum/categories/init", isAdmin, async (req, res, next) => {
     try {
       const existingCategories = await storage.getCategories();
       if (existingCategories.length > 0) {
@@ -465,7 +560,7 @@ export async function registerRoutes(
   app.post("/api/forum/posts", isEmailVerified, async (req, res, next) => {
     try {
       const user = req.user as any;
-      
+
       // Check if thread is locked
       const thread = await storage.getThread(req.body.threadId);
       if (!thread) {
@@ -475,8 +570,12 @@ export async function registerRoutes(
         return res.status(403).json({ message: "Thread ist geschlossen" });
       }
 
+      // Security: Sanitize content to prevent XSS attacks
+      const sanitizedContent = sanitizeHTML(req.body.content || '');
+
       const validatedData = insertPostSchema.parse({
         ...req.body,
+        content: sanitizedContent,
         authorId: user.id,
       });
 
@@ -495,7 +594,7 @@ export async function registerRoutes(
     try {
       const user = req.user as any;
       const post = await storage.getPost(req.params.id);
-      
+
       if (!post) {
         return res.status(404).json({ message: "Beitrag nicht gefunden" });
       }
@@ -509,7 +608,10 @@ export async function registerRoutes(
         return res.status(400).json({ message: "Inhalt darf nicht leer sein" });
       }
 
-      const updatedPost = await storage.updatePost(req.params.id, content);
+      // Security: Sanitize content to prevent XSS attacks
+      const sanitizedContent = sanitizeHTML(content);
+
+      const updatedPost = await storage.updatePost(req.params.id, sanitizedContent);
       res.json({ post: updatedPost });
     } catch (error) {
       next(error);
@@ -732,14 +834,15 @@ export async function registerRoutes(
     message: z.string().min(10, "Nachricht muss mindestens 10 Zeichen haben"),
   });
 
-  app.post("/api/contact", async (req, res, next) => {
+  app.post("/api/contact", contactLimiter, async (req, res, next) => {
     try {
       const validatedData = contactFormSchema.parse(req.body);
-      
+
+      // Security: Anonymize IP for DSGVO compliance
       console.log("Contact form submission:", {
         ...validatedData,
         timestamp: new Date().toISOString(),
-        ip: req.ip,
+        ip: anonymizeIP(req.ip),
       });
 
       // Forward to N8N webhook if configured
@@ -794,10 +897,9 @@ export async function registerRoutes(
       
       const existingAdmin = await storage.getUserByUsername(adminUsername);
       if (existingAdmin) {
-        // Update existing admin password
-        const hashedPassword = await bcrypt.hash(adminPassword, 10);
-        await storage.updateUser(existingAdmin.id, { password: hashedPassword });
-        console.log(`Admin user '${adminUsername}' password updated.`);
+        // Admin already exists, skip password update to prevent overwriting
+        console.log(`Admin user '${adminUsername}' already exists. Skipping password update.`);
+        console.log('To reset admin password, delete the user first or use a password reset flow.');
       } else {
         const hashedPassword = await bcrypt.hash(adminPassword, 10);
         const admin = await storage.createUser({
